@@ -61,7 +61,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
     API_KEYS: (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(k => k),
     TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-    GEMINI_MODEL: 'gemini-2.0-flash',
+    GEMINI_MODEL: 'gemini-3-flash-preview',
     MONGODB_URI: process.env.MONGODB_URI,
     MEDIA_TIMEOUT_MS: 300000, 
     CONTEXT_RETENTION_MS: 1800000, 
