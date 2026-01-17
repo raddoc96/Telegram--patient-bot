@@ -58,6 +58,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 
 // ==============================================================================
 
+
 const CONFIG = {
     API_KEYS: (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(k => k),
     TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
@@ -76,9 +77,9 @@ const bufferTimeouts = new Map();
 const contextSchema = new mongoose.Schema({
     chatId: String,
     messageId: String, 
-    originalMedia: Array, // Metadata about files sent
-    responseText: String, // The AI response text
-    mode: { type: String, enum: ['primary', 'secondary'], default: 'primary' }, // Track which bot answered
+    originalMedia: Array, 
+    responseText: String, 
+    mode: { type: String, enum: ['primary', 'secondary'], default: 'primary' }, 
     timestamp: { type: Date, default: Date.now }
 });
 contextSchema.index({ timestamp: 1 }, { expireAfterSeconds: CONFIG.CONTEXT_RETENTION_MS / 1000 });
@@ -169,7 +170,6 @@ async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
 }
 
 // --- GEMINI CORE ENGINE ---
-// Now accepts specific systemInstruction and optional mediaOverride
 async function generateGeminiResponse(contentParts, systemInstruction) {
     const keys = CONFIG.API_KEYS;
     if (keys.length === 0) throw new Error("No API Keys");
@@ -193,11 +193,10 @@ async function generateGeminiResponse(contentParts, systemInstruction) {
 // --- MAIN PROCESSOR ---
 async function processRequest(chatId, items, mode, previousContext = null, userQuery = null, targetFps = 3) {
     
-    // 1. Prepare Media (Only needed for Primary or Follow-up with new media)
+    // 1. Prepare Media
     const processedContent = [];
     const textNotes = [];
     
-    // Only process media if we have items
     if (items.length > 0) {
         for (const item of items) {
             if (item.type === 'video') {
@@ -229,7 +228,7 @@ async function processRequest(chatId, items, mode, previousContext = null, userQ
 
     // --- LOGIC BRANCHING ---
 
-    // A. FOLLOW-UP (User replying to bot)
+    // A. FOLLOW-UP (Reply)
     if (previousContext) {
         let prompt = "";
         const instruction = previousContext.mode === 'secondary' 
@@ -244,7 +243,6 @@ ${previousContext.responseText}
 ${textNotes.join('\n')}
 === USER QUESTION ===
 ${userQuery}
-
 Answer the question directly based on the context.`;
         } else {
             prompt = `User provides UPDATE/CORRECTION.
@@ -253,7 +251,6 @@ ${previousContext.responseText}
 === NEW INFO ===
 ${userQuery}
 ${textNotes.join('\n')}
-
 Generate UPDATED output.`;
         }
 
@@ -267,7 +264,6 @@ Generate UPDATED output.`;
         const prompt = `Analyze these medical files.
 === NOTES ===
 ${textNotes.join('\n')}
-
 Generate the Clinical Profile.`;
         
         const request = [prompt, ...processedContent];
@@ -277,11 +273,10 @@ Generate the Clinical Profile.`;
 
     // C. NEW REQUEST - SECONDARY/CHAINED (Trigger: ..)
     if (mode === 'secondary') {
-        // Step 1: Run Primary Logic Internal
+        // Step 1: Run Primary Logic (Internal)
         const promptPrimary = `Analyze these medical files.
 === NOTES ===
 ${textNotes.join('\n')}
-
 Generate the Clinical Profile.`;
         
         const requestPrimary = [promptPrimary, ...processedContent];
@@ -294,12 +289,15 @@ Generate the Clinical Profile.`;
 ${primaryResponse}
 === END PROFILE ===`;
 
-        // Secondary bot usually just analyzes text, but we can pass media if needed. 
-        // Based on request ("clinical profile... given as context"), we prioritize text.
-        const requestSecondary = [promptSecondary]; 
-        
+        const requestSecondary = [promptSecondary];
         const secondaryResponse = await generateGeminiResponse(requestSecondary, SECONDARY_SYSTEM_INSTRUCTION);
-        return { response: secondaryResponse, mode: 'secondary' };
+        
+        // Return BOTH responses so we can display the profile first, then the analysis
+        return { 
+            response: secondaryResponse, 
+            primaryResponse: primaryResponse, // <--- Added this
+            mode: 'secondary' 
+        };
     }
 }
 
@@ -342,8 +340,6 @@ bot.on(message('text'), async (ctx) => {
     const chatId = ctx.chat.id;
 
     // 1. CHECK TRIGGERS
-    // Primary Triggers: . .1 .2
-    // Secondary Triggers: .. ..1 ..2
     const isPrimary = /^(\.|(\.[1-3]))$/.test(text);
     const isSecondary = /^(\.\.|(\.\.[1-3]))$/.test(text);
 
@@ -351,7 +347,6 @@ bot.on(message('text'), async (ctx) => {
         const items = clearBuffer(chatId);
         if (items.length === 0) return ctx.reply("⚠️ Buffer empty. Send files first.");
 
-        // Parse FPS (Last character if it's a number, else 3)
         const lastChar = text.slice(-1);
         let fps = isNaN(lastChar) ? 3 : parseInt(lastChar);
         if (text === '.' || text === '..') fps = 3;
@@ -364,21 +359,28 @@ bot.on(message('text'), async (ctx) => {
         try {
             const result = await processRequest(chatId, items, mode, null, null, fps);
             
-            // Send Response
+            // IF SECONDARY MODE: Send the Primary Response (Clinical Profile) First!
+            if (result.primaryResponse) {
+                await ctx.reply(`📝 *Clinical Profile (Step 1):*\n\n${result.primaryResponse}`, { parse_mode: 'Markdown' });
+            }
+
+            // Send Final Response (Primary or Secondary)
             const parts = result.response.match(/[\s\S]{1,4000}/g) || [];
             let lastMsg;
             for (const part of parts) {
-                lastMsg = await ctx.reply(part, { parse_mode: 'Markdown' });
+                // If it was a secondary analysis, label it clearly
+                const prefix = result.primaryResponse ? "🧠 *Secondary Analysis (Step 2):*\n\n" : "";
+                lastMsg = await ctx.reply(prefix + part, { parse_mode: 'Markdown' });
             }
 
-            // Save Context with correct Mode
+            // Save Context
             if (lastMsg) {
                 await ContextModel.create({
                     chatId: String(chatId),
                     messageId: String(lastMsg.message_id),
                     originalMedia: items.map(i => ({ type: i.type, mime: i.mime })),
                     responseText: result.response,
-                    mode: result.mode // 'primary' or 'secondary'
+                    mode: result.mode 
                 });
             }
             ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(()=>{});
@@ -389,7 +391,7 @@ bot.on(message('text'), async (ctx) => {
         return;
     }
 
-    // 2. CHECK REPLY (Follow-up)
+    // 2. CHECK REPLY
     if (ctx.message.reply_to_message) {
         const replyId = String(ctx.message.reply_to_message.message_id);
         const context = await ContextModel.findOne({ chatId: String(chatId), messageId: replyId });
@@ -397,14 +399,8 @@ bot.on(message('text'), async (ctx) => {
         if (context) {
             const loadingMsg = await ctx.reply(`🔄 Analyzing reply (${context.mode} context)...`);
             try {
-                // Pass user text query + context. 
-                // Mode is derived from context inside processRequest
                 const result = await processRequest(
-                    chatId, 
-                    [], // No new media in text reply
-                    context.mode, // Pass current mode
-                    context, // Pass full context obj
-                    text // User query
+                    chatId, [], context.mode, context, text
                 );
                 
                 const sent = await ctx.reply(result.response, { parse_mode: 'Markdown' });
@@ -414,7 +410,7 @@ bot.on(message('text'), async (ctx) => {
                     messageId: String(sent.message_id),
                     originalMedia: context.originalMedia,
                     responseText: result.response,
-                    mode: context.mode // Keep the same mode for the chain
+                    mode: context.mode 
                 });
                 
                 ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(()=>{});
@@ -483,11 +479,11 @@ bot.on(message('audio'), ctx => handleMedia(ctx, 'audio'));
 (async () => {
     await connectMongoDB();
     const app = express();
-    app.get('/', (req, res) => res.send('Telegram Medical Bot V2 Running'));
+    app.get('/', (req, res) => res.send('Telegram Medical Bot V3 Running'));
     app.get('/health', (req, res) => res.json({status: 'ok'}));
     app.listen(process.env.PORT || 3000);
 
-    bot.launch(() => console.log('🚀 Telegram Bot Started (Dual Mode)'));
+    bot.launch(() => console.log('🚀 Telegram Bot Started (Dual Output)'));
     process.once('SIGINT', () => bot.stop('SIGINT'));
     process.once('SIGTERM', () => bot.stop('SIGTERM'));
 })();
