@@ -50,14 +50,16 @@ If user PROVIDES CONTEXT: Generate UPDATED Clinical Profile.`;
 
 // 2. NEW SECONDARY INSTRUCTION (For '..' commands)
 // TODO: Fill this with your new system instruction
-const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist.When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
+const SECONDARY_SYSTEM_INSTRUCTION = `You are a Secondary Medical Analyst. 
+Your goal is to take a "Clinical Profile" provided by a primary agent and perform a specific analysis on it.
+Analyze the provided Clinical Profile deeply and provide recommendations, potential differential diagnoses, or specific formatting as required.
+Do not just repeat the profile. Add value based on the profile provided.`;
 
 // 3. PROMPT TO TRIGGER SECONDARY BOT
 // TODO: Fill this with the specific prompt you want to send along with the profile
 const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from the patient's reports. Please analyze this profile according to your system instructions and provide the final output.`;
 
 // ==============================================================================
-
 
 const CONFIG = {
     API_KEYS: (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(k => k),
@@ -121,6 +123,41 @@ function resetTimeout(chatId, ctx) {
             await ctx.reply(`⏰ Timeout: Cleared ${items.length} pending files from buffer.`);
         }
     }, CONFIG.MEDIA_TIMEOUT_MS));
+}
+
+// --- SAFE MESSAGE SENDER (FIXES ERROR 400) ---
+async function sendSafeMessage(ctx, text, prefix = "") {
+    const MAX_LENGTH = 4000; // Leave buffer for safety
+    const fullText = prefix + text;
+    const chunks = [];
+
+    let remainingText = fullText;
+    while (remainingText.length > 0) {
+        if (remainingText.length <= MAX_LENGTH) {
+            chunks.push(remainingText);
+            break;
+        }
+        // Try to split at the nearest newline to avoid cutting words/tags in half
+        let splitIndex = remainingText.lastIndexOf('\n', MAX_LENGTH);
+        if (splitIndex === -1) splitIndex = MAX_LENGTH; // No newline found, hard split
+
+        chunks.push(remainingText.substring(0, splitIndex));
+        remainingText = remainingText.substring(splitIndex).trim(); // Remove leading whitespace
+    }
+
+    let lastSentMsg;
+    for (const chunk of chunks) {
+        try {
+            // 1. Try sending with Markdown
+            lastSentMsg = await ctx.reply(chunk, { parse_mode: 'Markdown' });
+        } catch (e) {
+            // 2. If Markdown fails (likely due to split tags), fallback to Plain Text
+            // This prevents the "Can't find end of entity" error
+            // console.log("Markdown failed, retrying plain text...");
+            lastSentMsg = await ctx.reply(chunk);
+        }
+    }
+    return lastSentMsg;
 }
 
 // --- SMART VIDEO PROCESSING ---
@@ -292,10 +329,10 @@ ${primaryResponse}
         const requestSecondary = [promptSecondary];
         const secondaryResponse = await generateGeminiResponse(requestSecondary, SECONDARY_SYSTEM_INSTRUCTION);
         
-        // Return BOTH responses so we can display the profile first, then the analysis
+        // Return BOTH responses
         return { 
             response: secondaryResponse, 
-            primaryResponse: primaryResponse, // <--- Added this
+            primaryResponse: primaryResponse, 
             mode: 'secondary' 
         };
     }
@@ -360,18 +397,14 @@ bot.on(message('text'), async (ctx) => {
             const result = await processRequest(chatId, items, mode, null, null, fps);
             
             // IF SECONDARY MODE: Send the Primary Response (Clinical Profile) First!
+            // We use sendSafeMessage to handle splitting and Markdown errors
             if (result.primaryResponse) {
-                await ctx.reply(`📝 *Clinical Profile (Step 1):*\n\n${result.primaryResponse}`, { parse_mode: 'Markdown' });
+                await sendSafeMessage(ctx, result.primaryResponse, "📝 *Clinical Profile (Step 1):*\n\n");
             }
 
             // Send Final Response (Primary or Secondary)
-            const parts = result.response.match(/[\s\S]{1,4000}/g) || [];
-            let lastMsg;
-            for (const part of parts) {
-                // If it was a secondary analysis, label it clearly
-                const prefix = result.primaryResponse ? "🧠 *Secondary Analysis (Step 2):*\n\n" : "";
-                lastMsg = await ctx.reply(prefix + part, { parse_mode: 'Markdown' });
-            }
+            const prefix = result.primaryResponse ? "🧠 *Secondary Analysis (Step 2):*\n\n" : "";
+            const lastMsg = await sendSafeMessage(ctx, result.response, prefix);
 
             // Save Context
             if (lastMsg) {
@@ -403,11 +436,11 @@ bot.on(message('text'), async (ctx) => {
                     chatId, [], context.mode, context, text
                 );
                 
-                const sent = await ctx.reply(result.response, { parse_mode: 'Markdown' });
+                const lastMsg = await sendSafeMessage(ctx, result.response);
                 
                 await ContextModel.create({
                     chatId: String(chatId),
-                    messageId: String(sent.message_id),
+                    messageId: String(lastMsg.message_id),
                     originalMedia: context.originalMedia,
                     responseText: result.response,
                     mode: context.mode 
@@ -479,11 +512,11 @@ bot.on(message('audio'), ctx => handleMedia(ctx, 'audio'));
 (async () => {
     await connectMongoDB();
     const app = express();
-    app.get('/', (req, res) => res.send('Telegram Medical Bot V3 Running'));
+    app.get('/', (req, res) => res.send('Telegram Medical Bot V3.1 Running'));
     app.get('/health', (req, res) => res.json({status: 'ok'}));
     app.listen(process.env.PORT || 3000);
 
-    bot.launch(() => console.log('🚀 Telegram Bot Started (Dual Output)'));
+    bot.launch(() => console.log('🚀 Telegram Bot Started'));
     process.once('SIGINT', () => bot.stop('SIGINT'));
     process.once('SIGTERM', () => bot.stop('SIGTERM'));
 })();
