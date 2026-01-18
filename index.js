@@ -50,16 +50,14 @@ If user PROVIDES CONTEXT: Generate UPDATED Clinical Profile.`;
 
 // 2. NEW SECONDARY INSTRUCTION (For '..' commands)
 // TODO: Fill this with your new system instruction
-const SECONDARY_SYSTEM_INSTRUCTION = `You are a Secondary Medical Analyst. 
-Your goal is to take a "Clinical Profile" provided by a primary agent and perform a specific analysis on it.
-Analyze the provided Clinical Profile deeply and provide recommendations, potential differential diagnoses, or specific formatting as required.
-Do not just repeat the profile. Add value based on the profile provided.`;
+const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist.When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
 
 // 3. PROMPT TO TRIGGER SECONDARY BOT
 // TODO: Fill this with the specific prompt you want to send along with the profile
 const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from the patient's reports. Please analyze this profile according to your system instructions and provide the final output.`;
 
 // ==============================================================================
+
 
 const CONFIG = {
     API_KEYS: (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(k => k),
