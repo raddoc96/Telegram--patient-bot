@@ -62,7 +62,7 @@ const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from th
 const CONFIG = {
     API_KEYS: (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(k => k),
     TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
+    GEMINI_MODEL: 'gemini-2.0-flash',
     MONGODB_URI: process.env.MONGODB_URI,
     MEDIA_TIMEOUT_MS: 300000, 
     CONTEXT_RETENTION_MS: 1800000, 
@@ -135,12 +135,11 @@ async function sendSafeMessage(ctx, text, prefix = "") {
             chunks.push(remainingText);
             break;
         }
-        // Try to split at the nearest newline to avoid cutting words/tags in half
         let splitIndex = remainingText.lastIndexOf('\n', MAX_LENGTH);
-        if (splitIndex === -1) splitIndex = MAX_LENGTH; // No newline found, hard split
+        if (splitIndex === -1) splitIndex = MAX_LENGTH; 
 
         chunks.push(remainingText.substring(0, splitIndex));
-        remainingText = remainingText.substring(splitIndex).trim(); // Remove leading whitespace
+        remainingText = remainingText.substring(splitIndex).trim(); 
     }
 
     let lastSentMsg;
@@ -149,9 +148,7 @@ async function sendSafeMessage(ctx, text, prefix = "") {
             // 1. Try sending with Markdown
             lastSentMsg = await ctx.reply(chunk, { parse_mode: 'Markdown' });
         } catch (e) {
-            // 2. If Markdown fails (likely due to split tags), fallback to Plain Text
-            // This prevents the "Can't find end of entity" error
-            // console.log("Markdown failed, retrying plain text...");
+            // 2. If Markdown fails, fallback to Plain Text
             lastSentMsg = await ctx.reply(chunk);
         }
     }
@@ -244,7 +241,9 @@ async function processRequest(chatId, items, mode, previousContext = null, userQ
                         if (item.caption) textNotes.push(`[Video Frame Caption]: ${item.caption}`);
                     });
                 } catch (e) { console.error('Video error'); }
-            } else if (['image', 'pdf', 'audio'].includes(item.type)) {
+            
+            // FIXED: Added 'voice' to the included types list
+            } else if (['image', 'pdf', 'audio', 'voice'].includes(item.type)) {
                 try {
                     const response = await axios.get(item.url, { responseType: 'arraybuffer' });
                     processedContent.push({
@@ -255,6 +254,7 @@ async function processRequest(chatId, items, mode, previousContext = null, userQ
                     });
                     if (item.caption) textNotes.push(`[${item.type} caption]: ${item.caption}`);
                 } catch (e) { console.error('Download error'); }
+            
             } else if (item.type === 'text') {
                 textNotes.push(item.text);
             }
@@ -355,7 +355,7 @@ const bot = new Telegraf(CONFIG.TELEGRAM_TOKEN);
 bot.command('start', (ctx) => {
     ctx.reply(`🏥 *Medical Bot Ready*
     
-1️⃣ Send Files (Images, PDF, Video)
+1️⃣ Send Files (Images, PDF, Video, Voice)
 2️⃣ Send command:
    • *.*  (Standard Clinical Profile)
    • *..* (Secondary Analysis Chain)
@@ -395,7 +395,6 @@ bot.on(message('text'), async (ctx) => {
             const result = await processRequest(chatId, items, mode, null, null, fps);
             
             // IF SECONDARY MODE: Send the Primary Response (Clinical Profile) First!
-            // We use sendSafeMessage to handle splitting and Markdown errors
             if (result.primaryResponse) {
                 await sendSafeMessage(ctx, result.primaryResponse, "📝 *Clinical Profile (Step 1):*\n\n");
             }
@@ -489,6 +488,8 @@ const handleMedia = async (ctx, type) => {
         const fileLink = await ctx.telegram.getFileLink(fileId);
         getBuffer(chatId).push({
             type: type === 'photo' ? 'image' : type,
+            // Capture 'voice' correctly in the buffer item type
+            type: type === 'photo' ? 'image' : type, 
             url: fileLink.href,
             mime: mime,
             caption: caption || ''
@@ -510,7 +511,7 @@ bot.on(message('audio'), ctx => handleMedia(ctx, 'audio'));
 (async () => {
     await connectMongoDB();
     const app = express();
-    app.get('/', (req, res) => res.send('Telegram Medical Bot V3.1 Running'));
+    app.get('/', (req, res) => res.send('Telegram Medical Bot V3.2 Running'));
     app.get('/health', (req, res) => res.json({status: 'ok'}));
     app.listen(process.env.PORT || 3000);
 
