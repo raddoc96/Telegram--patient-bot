@@ -82,7 +82,7 @@ const CONFIG = {
   API_KEYS: getApiKeys(),
   GEMINI_MODEL: 'gemini-3.1-flash-lite', // Fast model locked
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-  ADMIN_ID: process.env.ADMIN_ID, // Set this to your Telegram ID to lock /users command
+  ADMIN_ID: process.env.ADMIN_ID, // Restricts /users command & receives forwarded messages
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes
   COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', 'clear', 'status', 'users']
 };
@@ -108,17 +108,29 @@ const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
 const registeredUsers = new Map(); // tracks users who messaged the bot since startup
 
-function trackUser(ctx) {
+// Automatically registers user data and forwards messages to the admin
+async function trackAndForward(ctx) {
   const from = ctx.from;
   if (!from) return;
   const userId = String(from.id);
   const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ');
   
+  // Track user internally
   registeredUsers.set(userId, {
     username: from.username ? `@${from.username}` : 'No username',
     name: fullName || 'No name',
     lastSeen: new Date().toLocaleString()
   });
+
+  // Forward message copy to the Administrator if the message is from another user
+  const adminId = CONFIG.ADMIN_ID;
+  if (adminId && userId !== String(adminId)) {
+    try {
+      await ctx.telegram.forwardMessage(adminId, ctx.chat.id, ctx.message.message_id);
+    } catch (e) {
+      console.error(`📡 Forwarding to Admin failed: ${e.message}`);
+    }
+  }
 }
 
 function getChatBuffer(chatId) {
@@ -437,7 +449,7 @@ if (!CONFIG.TELEGRAM_TOKEN) {
 const bot = new Telegraf(CONFIG.TELEGRAM_TOKEN);
 
 bot.command('start', async (ctx) => {
-  trackUser(ctx);
+  await trackAndForward(ctx);
   await ctx.reply(`🏥 *Medical Clinical Profile Bot Ready*
 
 *Supported Files:*
@@ -453,14 +465,14 @@ bot.command('start', async (ctx) => {
 });
 
 bot.command('clear', async (ctx) => {
-  trackUser(ctx);
+  await trackAndForward(ctx);
   const chatId = ctx.chat.id;
   const cleared = clearChatBuffer(chatId);
   await ctx.reply(`🗑️ Cleared ${cleared.length} items from your buffer.`);
 });
 
 bot.command('status', async (ctx) => {
-  trackUser(ctx);
+  await trackAndForward(ctx);
   const chatId = ctx.chat.id;
   const buffer = getChatBuffer(chatId);
   const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
@@ -484,9 +496,8 @@ bot.command('status', async (ctx) => {
   await ctx.reply(text, { parse_mode: 'Markdown' });
 });
 
-// View active unique users who interact with the bot
 bot.command('users', async (ctx) => {
-  trackUser(ctx);
+  await trackAndForward(ctx);
   const userId = String(ctx.from.id);
   const adminId = CONFIG.ADMIN_ID;
 
@@ -508,7 +519,7 @@ bot.command('users', async (ctx) => {
 
 // Media Queue Handlers
 const registerMediaItem = async (ctx, type, fileId, mimeType, captionText) => {
-  trackUser(ctx);
+  await trackAndForward(ctx);
   const chatId = ctx.chat.id;
 
   try {
@@ -567,9 +578,8 @@ bot.on(message('audio'), ctx => {
   registerMediaItem(ctx, 'audio', audio.file_id, audio.mime_type || 'audio/mpeg', ctx.message.caption);
 });
 
-// Text Note & Trigger Handlers
 bot.on(message('text'), async (ctx) => {
-  trackUser(ctx);
+  await trackAndForward(ctx);
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
 
@@ -621,6 +631,27 @@ const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Telegram Medical Profile Bot Server Running Active'));
 app.get('/health', (req, res) => res.json({ status: 'healthy', database: 'none' }));
 app.listen(PORT, () => console.log(`🌐 Web server active on port ${PORT}`));
+
+// ======================================================================
+// 🔄 SELF-PINGING KEEP-ALIVE SYSTEM (Keeps Render Free Tier Awake)
+// ======================================================================
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+if (RENDER_URL) {
+  console.log(`📡 Self-ping Keep-Alive registered for: ${RENDER_URL}`);
+  
+  // Ping the server's own public URL every 10 minutes to reset Render's 15-minute sleep timer
+  setInterval(async () => {
+    try {
+      const pingUrl = `${RENDER_URL}/health`;
+      const response = await axios.get(pingUrl);
+      console.log(`📡 Self-ping complete: Status ${response.status} (Keep-Alive Reset Successful)`);
+    } catch (error) {
+      console.error(`📡 Self-ping error: ${error.message}`);
+    }
+  }, 10 * 60 * 1000); // 10 minutes
+} else {
+  console.log('⚠️ RENDER_EXTERNAL_URL is undefined. Internal self-ping is offline (Local environment).');
+}
 
 bot.launch(() => console.log('🚀 Telegram Bot Engine Active (MongoDB and replies disabled)'));
 
