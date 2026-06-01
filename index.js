@@ -2,7 +2,6 @@ import { Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import express from 'express';
-import mongoose from 'mongoose';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import axios from 'axios';
@@ -10,512 +9,620 @@ import fs from 'fs';
 import os from 'os';
 import { join } from 'path';
 
-// --- CONFIGURATION ---
+// Setup FFmpeg path automatically
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
-// ==============================================================================
-// 🟢 USER CONFIGURATION AREA
-// ==============================================================================
+// Helper to parse multiple Gemini keys
+const getApiKeys = () => {
+  const keys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
+  return keys.split(',').map(k => k.trim()).filter(k => k.length > 0);
+};
 
-// 1. ORIGINAL RADIOLOGY INSTRUCTION (For '.' commands)
-const PRIMARY_SYSTEM_INSTRUCTION = `You are an expert medical AI assistant specializing in radiology. You have two modes of operation:
+// ======================================================================
+// 🟢 CONFIGURATION AREA
+// ======================================================================
 
-**MODE 1: CLINICAL PROFILE GENERATION**
+const PRIMARY_SYSTEM_INSTRUCTION = `You are an expert medical AI assistant specializing in radiology. 
+
+**CLINICAL PROFILE GENERATION**
 When provided with medical files (images, PDFs, audio recordings, or video files) and/or text context, you extract and analyze all content to create a concise and comprehensive "Clinical Profile".
 
 IMPORTANT INSTRUCTION - IF THE HANDWRITTEN TEXT IS NOT LEGIBLE, FEEL FREE TO USE CODE INTERPRETATION AND LOGIC IN THE CONTEXT OF OTHER TEXTS TO DECIPHER THE ILLEGIBLE TEXT
 
 FOR AUDIO FILES: Transcribe the audio content carefully and extract all relevant medical information mentioned.
+
 FOR VIDEO FILES: Analyze the video content, transcribe any audio, and extract all visible medical information including any text, scans, or documents shown.
+
 FOR TEXT MESSAGES: These may contain additional clinical context, patient history, or notes that should be incorporated into the Clinical Profile.
 
 YOUR RESPONSE MUST BE BASED SOLELY ON THE PROVIDED CONTENT (files AND text).
 
 Follow these strict instructions for Clinical Profile generation:
-Analyze All Content: Meticulously examine all provided files.
-Extract Key Information: Scan types, Dates, Key findings, Clinical history.
+
+Analyze All Content: Meticulously examine all provided files - images, PDFs, audio recordings, and video files, as well as any accompanying text messages. This may include prior medical scan reports (like USG, CT, MRI), clinical notes, voice memos, video recordings, or other relevant documents.
+
+Extract Key Information: From the content, identify and extract all pertinent information, such as:
+- Scan types (e.g., USG, CT Brain).
+- Dates of scans or documents.
+- Key findings, measurements, or impressions from reports.
+- Relevant clinical history mentioned in notes, audio, video, or text messages.
 
 Synthesize into a Clinical Profile:
-- Combine all extracted information into a single, cohesive paragraph.
+- Combine all extracted information into a single, cohesive paragraph. This represents a 100% recreation of the relevant clinical details from the provided content.
+- If there are repeated or vague findings across multiple documents, synthesize them into a single, concise statement.
+- Frame sentences properly to be concise, but you MUST NOT omit any important clinical details. Prioritize completeness of clinical information over extreme brevity.
 - You MUST strictly exclude any mention of the patient's name, age, or gender.
-- If multiple dated scan reports are present, arrange chronologically.
+- If multiple dated scan reports are present, you MUST arrange their summaries chronologically in ascending order based on their dates.
+- If a date is not available for a scan, refer to it as "Previous [Scan Type]...".
 
 Formatting for Clinical Profile:
 - The final output MUST be a single paragraph.
-- This paragraph MUST start with "Clinical Profile:" and the entire content (including the prefix) must be wrapped in single asterisks. For example: "*Clinical Profile: Previous USG dated 01/01/2023 showed mild hepatomegaly...*"
+- This paragraph MUST start with "Clinical Profile:" and the entire content (including the prefix) must be wrapped in single asterisks. For example: "*Clinical Profile: Previous USG dated 01/01/2023 showed mild hepatomegaly. Patient also has a H/o hypertension as noted in the clinical sheet.*"
 
-**MODE 2: FOLLOW-UP INTERACTION**
-If user ASKS A QUESTION: Answer directly based on Clinical Profile.
-If user PROVIDES CONTEXT: Generate UPDATED Clinical Profile.`;
+Do not output the raw transcribed text.
+Do not output JSON or Markdown code blocks.
+Return ONLY the single formatted paragraph described above.
 
-// 2. NEW SECONDARY INSTRUCTION (For '..' commands)
-// TODO: Fill this with your new system instruction
-const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist.When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
+IMPORTANT ADDITIONAL OUTPUT:
+After the Clinical Profile paragraph, you MUST output a second line (separated by a blank line) in EXACTLY this format:
+<<JSON>>{"mrn":"<Registration Number/MRN or Not mentioned>","age":"<age or unknown>","sex":"<M/F/unknown>","study":"<imaging study indicated or Not mentioned>","brief":"<very concise reason for scan using abbreviations like H/o, C/o, K/c/o, etc., mentioning duration of symptoms>"}<<JSON>>
 
-// 3. PROMPT TO TRIGGER SECONDARY BOT
-// TODO: Fill this with the specific prompt you want to send along with the profile
+Rules for the JSON line:
+- mrn: Extract the patient's Medical Record Number (MRN), Registration Number, ID, UID, or IP/OP number from the content. If not found, use "Not mentioned".
+- age: Extract patient age from the content. If not found, use "unknown".
+- sex: Extract patient sex/gender from the content. Use "M" for male, "F" for female. If not found, use "unknown".
+- study: The imaging study that is currently indicated/requested (e.g., "CT Thorax", "MRI Brain", "USG Abdomen"). If not obvious from the content, use "Not mentioned".
+- brief: A very short clinical summary using medical abbreviations. Example: "H/o fever and cough for 4 days, SOB for 2 days, K/c/o ILD, Now scan done to r/o infective exacerbation" or "C/o Giddiness for 15 days, slurred speech for 5 days, Right upper limb weakness for 2 days, K/c/o HTN/DM, Now scan done to r/o cerebellar infarct"`;
+
+const SECONDARY_SYSTEM_INSTRUCTION = `You are an expert radiologist. When you receive a context, it is mostly about a patient and sometimes they might have been advised with any imaging modality. You analyse that info and then advise regarding that as an expert radiologist what to be seen in that specific imaging modality for that specific patient including various hypothetical imaging findings from common to less common for that patient condition in that specific imaging modality. suppose of you cant indentify thr specific imaging modality in thr given context, you yourself choose the appropriate imaging modality based on the specific conditions context`;
+
 const SECONDARY_TRIGGER_PROMPT = `Here is the Clinical Profile generated from the patient's reports. Please analyze this profile according to your system instructions and provide the final output.`;
 
-// ==============================================================================
-
-
 const CONFIG = {
-    API_KEYS: (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(k => k),
-    TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-    GEMINI_MODEL: 'gemini-3-flash-preview',
-    MONGODB_URI: process.env.MONGODB_URI,
-    MEDIA_TIMEOUT_MS: 300000, 
-    CONTEXT_RETENTION_MS: 1800000, 
-    MAX_STORED_CONTEXTS: 20
+  API_KEYS: getApiKeys(),
+  GEMINI_MODEL: 'gemini-3.1-flash-lite', // Fast model locked
+  TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+  ADMIN_ID: process.env.ADMIN_ID, // Set this to your Telegram ID to lock /users command
+  MEDIA_TIMEOUT_MS: 300000, // 5 minutes
+  COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', 'clear', 'status', 'users']
 };
 
-// --- DATA STRUCTURES ---
-const userBuffers = new Map(); 
-const bufferTimeouts = new Map(); 
+const GROUP_REPLY_FOOTER = `
 
-// --- MONGODB SETUP ---
-const contextSchema = new mongoose.Schema({
-    chatId: String,
-    messageId: String, 
-    originalMedia: Array, 
-    responseText: String, 
-    mode: { type: String, enum: ['primary', 'secondary'], default: 'primary' }, 
-    timestamp: { type: Date, default: Date.now }
-});
-contextSchema.index({ timestamp: 1 }, { expireAfterSeconds: CONFIG.CONTEXT_RETENTION_MS / 1000 });
-const ContextModel = mongoose.model('Context', contextSchema);
+━━━━━━━━━━━━━━━━━━━━━━
+🖼️ *Go here to see the scan images:*
+https://view.stradus.com/
 
-async function connectMongoDB() {
-    if (!CONFIG.MONGODB_URI) return console.log('⚠️ No MongoDB URI - Contexts wont persist restarts');
-    try {
-        await mongoose.connect(CONFIG.MONGODB_URI);
-        console.log('✅ MongoDB Connected');
-    } catch (e) {
-        console.error('❌ MongoDB Error:', e.message);
+🤖 *Copy-paste the clinical profile here to get suggestions regarding MRI protocols:*
+https://ai.studio/apps/86a65a19-cf2f-46de-b4d0-9a941be83604
+
+🔗 https://mri-protocols.vercel.app/
+
+📚 *MRI protocol books*
+https://notebooklm.google.com/notebook/467e8684-c512-488f-b1f7-3a450e344cd5`;
+
+// ======================================================================
+// 📊 DATA STORAGE, TIMEOUTS, USER TRACKING (In-Memory Only)
+// ======================================================================
+const chatMediaBuffers = new Map();
+const chatTimeouts = new Map();
+const registeredUsers = new Map(); // tracks users who messaged the bot since startup
+
+function trackUser(ctx) {
+  const from = ctx.from;
+  if (!from) return;
+  const userId = String(from.id);
+  const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ');
+  
+  registeredUsers.set(userId, {
+    username: from.username ? `@${from.username}` : 'No username',
+    name: fullName || 'No name',
+    lastSeen: new Date().toLocaleString()
+  });
+}
+
+function getChatBuffer(chatId) {
+  if (!chatMediaBuffers.has(chatId)) {
+    chatMediaBuffers.set(chatId, []);
+  }
+  return chatMediaBuffers.get(chatId);
+}
+
+function clearChatBuffer(chatId) {
+  if (chatTimeouts.has(chatId)) {
+    clearTimeout(chatTimeouts.get(chatId));
+    chatTimeouts.delete(chatId);
+  }
+  const items = chatMediaBuffers.get(chatId) || [];
+  chatMediaBuffers.delete(chatId);
+  return items;
+}
+
+function resetChatTimeout(chatId, ctx) {
+  if (chatTimeouts.has(chatId)) {
+    clearTimeout(chatTimeouts.get(chatId));
+  }
+
+  chatTimeouts.set(chatId, setTimeout(async () => {
+    const cleared = clearChatBuffer(chatId);
+    if (cleared.length > 0) {
+      try {
+        await ctx.reply(`⏰ *Buffer Timeout:* Your pending ${cleared.length} files were cleared due to inactivity. Please upload them again.`);
+      } catch (e) {
+        console.error('Timeout message error:', e.message);
+      }
     }
+  }, CONFIG.MEDIA_TIMEOUT_MS));
 }
 
-// --- HELPER FUNCTIONS ---
+// ======================================================================
+// 🛠️ HELPERS (Formatting, Downloader, Frame Extractor, Chunked Sender)
+// ======================================================================
 
-function getBuffer(chatId) {
-    if (!userBuffers.has(chatId)) userBuffers.set(chatId, []);
-    return userBuffers.get(chatId);
+async function getTelegramFileAsBase64(ctx, fileId) {
+  const fileLink = await ctx.telegram.getFileLink(fileId);
+  const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+  return Buffer.from(response.data).toString('base64');
 }
 
-function clearBuffer(chatId) {
-    if (bufferTimeouts.has(chatId)) {
-        clearTimeout(bufferTimeouts.get(chatId));
-        bufferTimeouts.delete(chatId);
-    }
-    const items = userBuffers.get(chatId) || [];
-    userBuffers.delete(chatId);
-    return items;
-}
-
-function resetTimeout(chatId, ctx) {
-    if (bufferTimeouts.has(chatId)) clearTimeout(bufferTimeouts.get(chatId));
-    
-    bufferTimeouts.set(chatId, setTimeout(async () => {
-        const items = clearBuffer(chatId);
-        if (items.length > 0) {
-            await ctx.reply(`⏰ Timeout: Cleared ${items.length} pending files from buffer.`);
-        }
-    }, CONFIG.MEDIA_TIMEOUT_MS));
-}
-
-// --- SAFE MESSAGE SENDER (FIXES ERROR 400) ---
-async function sendSafeMessage(ctx, text, prefix = "") {
-    const MAX_LENGTH = 4000; // Leave buffer for safety
-    const fullText = prefix + text;
-    const chunks = [];
-
-    let remainingText = fullText;
-    while (remainingText.length > 0) {
-        if (remainingText.length <= MAX_LENGTH) {
-            chunks.push(remainingText);
-            break;
-        }
-        let splitIndex = remainingText.lastIndexOf('\n', MAX_LENGTH);
-        if (splitIndex === -1) splitIndex = MAX_LENGTH; 
-
-        chunks.push(remainingText.substring(0, splitIndex));
-        remainingText = remainingText.substring(splitIndex).trim(); 
-    }
-
-    let lastSentMsg;
-    for (const chunk of chunks) {
-        try {
-            // 1. Try sending with Markdown
-            lastSentMsg = await ctx.reply(chunk, { parse_mode: 'Markdown' });
-        } catch (e) {
-            // 2. If Markdown fails, fallback to Plain Text
-            lastSentMsg = await ctx.reply(chunk);
-        }
-    }
-    return lastSentMsg;
-}
-
-// --- SMART VIDEO PROCESSING ---
 async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
-    return new Promise((resolve, reject) => {
-        const tempId = Math.random().toString(36).substring(7);
-        const tempDir = os.tmpdir();
-        const inputPath = join(tempDir, `input_${tempId}.mp4`);
-        const outputPattern = join(tempDir, `frame_${tempId}_%03d.jpg`);
+  return new Promise((resolve, reject) => {
+    const tempId = Math.random().toString(36).substring(7);
+    const tempDir = os.tmpdir();
+    const inputPath = join(tempDir, `input_${tempId}.mp4`);
+    const outputPattern = join(tempDir, `frame_${tempId}_%03d.jpg`);
 
-        fs.writeFileSync(inputPath, videoBuffer);
+    fs.writeFileSync(inputPath, videoBuffer);
 
-        const batchSize = 3;
-        const inputFps = targetFps * batchSize;
-        const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
+    const batchSize = 3;
+    const inputFps = targetFps * batchSize;
+    const videoFilter = `fps=${inputFps},thumbnail=${batchSize}`;
 
-        console.log(`🎬 Smart Extract: Target ${targetFps}fps`);
+    console.log(`Smart Frame Extraction: Target ${targetFps}fps`);
 
-        ffmpeg(inputPath)
-            .outputOptions([`-vf ${videoFilter}`, '-vsync 0', '-q:v 2'])
-            .output(outputPattern)
-            .on('end', () => {
-                try {
-                    const files = fs.readdirSync(tempDir)
-                        .filter(f => f.startsWith(`frame_${tempId}_`) && f.endsWith('.jpg'))
-                        .sort();
-
-                    const frames = files.map(file => {
-                        const path = join(tempDir, file);
-                        const buffer = fs.readFileSync(path);
-                        fs.unlinkSync(path);
-                        return buffer.toString('base64');
-                    });
-
-                    fs.unlinkSync(inputPath);
-                    resolve(frames);
-                } catch (err) {
-                    reject(err);
-                }
-            })
-            .on('error', (err) => {
-                try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch(e){}
-                reject(err);
-            })
-            .run();
-    });
-}
-
-// --- GEMINI CORE ENGINE ---
-async function generateGeminiResponse(contentParts, systemInstruction) {
-    const keys = CONFIG.API_KEYS;
-    if (keys.length === 0) throw new Error("No API Keys");
-
-    for (let i = 0; i < keys.length; i++) {
+    ffmpeg(inputPath)
+      .outputOptions([`-vf ${videoFilter}`, '-vsync 0', '-q:v 2'])
+      .output(outputPattern)
+      .on('end', () => {
         try {
-            const genAI = new GoogleGenerativeAI(keys[i]);
-            const model = genAI.getGenerativeModel({ 
-                model: CONFIG.GEMINI_MODEL, 
-                systemInstruction: systemInstruction 
+          const files = fs.readdirSync(tempDir)
+            .filter(f => f.startsWith(`frame_${tempId}_`) && f.endsWith('.jpg'))
+            .sort();
+
+          const frames = files.map(file => {
+            const path = join(tempDir, file);
+            const buffer = fs.readFileSync(path);
+            fs.unlinkSync(path);
+            return buffer.toString('base64');
+          });
+
+          fs.unlinkSync(inputPath);
+          resolve(frames);
+        } catch (err) {
+          reject(err);
+        }
+      })
+      .on('error', (err) => {
+        try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (e) {}
+        reject(err);
+      })
+      .run();
+  });
+}
+
+function parseJsonFromResponse(responseText) {
+  const jsonMatch = responseText.match(/<<JSON>>(.*?)<<JSON>>/s);
+  if (jsonMatch && jsonMatch[1]) {
+    try {
+      return JSON.parse(jsonMatch[1].trim());
+    } catch (e) {
+      console.log(`⚠️ Failed to parse JSON block: ${e.message}`);
+      return null;
+    }
+  }
+  return null;
+}
+
+function stripJsonFromResponse(responseText) {
+  return responseText.replace(/\n*<<JSON>>.*?<<JSON>>\n*/s, '').trim();
+}
+
+function formatJsonBlock(jsonData) {
+  if (!jsonData) return '';
+  const mrn = jsonData.mrn || 'Not mentioned';
+  const age = jsonData.age || 'unknown';
+  const sex = jsonData.sex || 'unknown';
+  const study = jsonData.study || 'Not mentioned';
+  const brief = jsonData.brief || '';
+  return `\n\n📋 *Quick Reference:*\n• MRN/Reg No: ${mrn}\n• Age: ${age}\n• Sex: ${sex}\n• Study: ${study}\n• Brief: ${brief}`;
+}
+
+async function sendSafeMessage(ctx, text) {
+  const MAX_LENGTH = 4000;
+  const chunks = [];
+  let remainingText = text;
+
+  while (remainingText.length > 0) {
+    if (remainingText.length <= MAX_LENGTH) {
+      chunks.push(remainingText);
+      break;
+    }
+    let splitIndex = remainingText.lastIndexOf('\n', MAX_LENGTH);
+    if (splitIndex === -1) splitIndex = MAX_LENGTH;
+
+    chunks.push(remainingText.substring(0, splitIndex));
+    remainingText = remainingText.substring(splitIndex).trim();
+  }
+
+  let lastSentMsg;
+  for (const chunk of chunks) {
+    try {
+      lastSentMsg = await ctx.reply(chunk, { parse_mode: 'Markdown' });
+    } catch (e) {
+      lastSentMsg = await ctx.reply(chunk);
+    }
+  }
+  return lastSentMsg;
+}
+
+// ======================================================================
+// 🧠 GEMINI API FAILOVER LOOP (Locked to fast model config)
+// ======================================================================
+async function generateGeminiContent(requestContent, systemInstruction) {
+  const keys = CONFIG.API_KEYS;
+  if (keys.length === 0) {
+    throw new Error('No API keys configured! Check GEMINI_API_KEYS variable.');
+  }
+
+  let lastErrorMsg = '';
+  const modelName = CONFIG.GEMINI_MODEL;
+
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      if (i > 0) {
+        console.log(`⚠️ Failover: Trying Backup API Key #${i + 1}...`);
+        await new Promise(r => setTimeout(r, 1500));
+      }
+
+      const genAI = new GoogleGenerativeAI(keys[i]);
+      const modelConfig = { model: modelName };
+      
+      if (systemInstruction) {
+        modelConfig.systemInstruction = systemInstruction;
+      }
+
+      const model = genAI.getGenerativeModel(modelConfig);
+      const result = await model.generateContent(requestContent);
+      const responseText = result.response.text();
+
+      if (!responseText) {
+        throw new Error("Received empty response from API");
+      }
+
+      return responseText;
+
+    } catch (error) {
+      lastErrorMsg = error.message;
+      console.error(`❌ Key #${i + 1} failed:`, error.message);
+    }
+  }
+
+  throw new Error(`All API keys failed. Last error: ${lastErrorMsg}`);
+}
+
+// ======================================================================
+// 🚀 PIPELINE PROCESSOR
+// ======================================================================
+async function processMedia(ctx, chatId, mediaFiles, targetFps = 3, isSecondaryMode = false) {
+  try {
+    const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
+    const captions = [];
+    const textContents = [];
+    const binaryMedia = [];
+
+    // Smart frame extraction for videos
+    const processedMedia = [];
+    for (const m of mediaFiles) {
+      if (m.type === 'video') {
+        try {
+          const videoBuffer = Buffer.from(m.data, 'base64');
+          const frames = await extractFramesFromVideo(videoBuffer, targetFps);
+          frames.forEach(frameData => {
+            processedMedia.push({
+              type: 'image',
+              data: frameData,
+              mimeType: 'image/jpeg',
+              caption: m.caption ? `[Frame from video] ${m.caption}` : '[Frame from video]'
             });
-            const result = await model.generateContent(contentParts);
-            return result.response.text();
-        } catch (e) {
-            console.log(`⚠️ Key ${i} failed: ${e.message}`);
+          });
+        } catch (err) {
+          console.error(`Video extraction failed, treating as standard video: ${err.message}`);
+          processedMedia.push(m);
         }
+      } else {
+        processedMedia.push(m);
+      }
     }
-    throw new Error("All API keys failed.");
+
+    processedMedia.forEach(m => {
+      if (m.type === 'image') {
+        counts.images++;
+        binaryMedia.push(m);
+        if (m.caption) captions.push(`[Image caption]: ${m.caption}`);
+      } else if (m.type === 'pdf') {
+        counts.pdfs++;
+        binaryMedia.push(m);
+        if (m.caption) captions.push(`[PDF caption]: ${m.caption}`);
+      } else if (m.type === 'audio' || m.type === 'voice') {
+        counts.audio++;
+        binaryMedia.push(m);
+        if (m.caption) captions.push(`[Audio caption]: ${m.caption}`);
+      } else if (m.type === 'text') {
+        counts.texts++;
+        textContents.push(`[Text note]: ${m.content}`);
+      }
+    });
+
+    const contentParts = binaryMedia.map(m => ({
+      inlineData: { data: m.data, mimeType: m.mimeType }
+    }));
+
+    const allOriginalText = [...captions, ...textContents];
+    let promptParts = [];
+    if (counts.images > 0) promptParts.push(`${counts.images} image(s)`);
+    if (counts.pdfs > 0) promptParts.push(`${counts.pdfs} PDF document(s)`);
+    if (counts.audio > 0) promptParts.push(`${counts.audio} audio/voice recording(s)`);
+
+    let promptText = `Analyze these ${promptParts.join(', ')} along with the following additional text notes/context, and generate the Clinical Profile.
+
+=== ADDITIONAL TEXT NOTES ===
+${allOriginalText.join('\n\n')}
+=== END OF TEXT NOTES ===
+
+For audio files, transcribe the content first.`;
+
+    const currentDate = new Date().toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'long', year: 'numeric'
+    });
+    promptText += `\n\n⚠️ CRITICAL INSTRUCTION REGARDING DATES: 
+Today's current date is ${currentDate}. Please pay extremely close attention to the dates printed or handwritten on the medical reports. You MUST extract and transcribe the year EXACTLY as it appears in the images/documents. Do NOT let your training biases replace the current year with past years.`;
+
+    const requestContent = contentParts.length > 0 ? [promptText, ...contentParts] : [promptText];
+
+    // STEP 1: Clinical Profile Compile
+    const rawPrimaryResponse = await generateGeminiContent(requestContent, PRIMARY_SYSTEM_INSTRUCTION);
+    const jsonData = parseJsonFromResponse(rawPrimaryResponse);
+    const primaryResponseText = stripJsonFromResponse(rawPrimaryResponse);
+
+    if (isSecondaryMode) {
+      let step1Text = `📝 *Clinical Profile (Step 1):*\n\n${primaryResponseText}`;
+      if (jsonData) step1Text += formatJsonBlock(jsonData);
+      step1Text += GROUP_REPLY_FOOTER;
+
+      await sendSafeMessage(ctx, step1Text);
+
+      // STEP 2: Secondary modality guidelines
+      const secondaryPrompt = `${SECONDARY_TRIGGER_PROMPT}\n\n=== CLINICAL PROFILE ===\n${primaryResponseText}\n=== END PROFILE ===`;
+      const secondaryResponseText = await generateGeminiContent([secondaryPrompt], SECONDARY_SYSTEM_INSTRUCTION);
+
+      let step2Text = `🧠 *Secondary Analysis (Step 2):*\n\n${secondaryResponseText}`;
+      step2Text += GROUP_REPLY_FOOTER;
+
+      await sendSafeMessage(ctx, step2Text);
+      return;
+    }
+
+    let finalResponseText = primaryResponseText;
+    if (jsonData) {
+      finalResponseText += formatJsonBlock(jsonData);
+    }
+    finalResponseText += GROUP_REPLY_FOOTER;
+
+    await sendSafeMessage(ctx, finalResponseText);
+
+  } catch (error) {
+    console.error('Execution pipeline error:', error);
+    await ctx.reply(`❌ Error processing request: ${error.message}`);
+  }
 }
 
-// --- MAIN PROCESSOR ---
-async function processRequest(chatId, items, mode, previousContext = null, userQuery = null, targetFps = 3) {
-    
-    // 1. Prepare Media
-    const processedContent = [];
-    const textNotes = [];
-    
-    if (items.length > 0) {
-        for (const item of items) {
-            if (item.type === 'video') {
-                try {
-                    const response = await axios.get(item.url, { responseType: 'arraybuffer' });
-                    const videoBuffer = Buffer.from(response.data);
-                    const frames = await extractFramesFromVideo(videoBuffer, targetFps);
-                    frames.forEach(frame => {
-                        processedContent.push({ inlineData: { data: frame, mimeType: 'image/jpeg' } });
-                        if (item.caption) textNotes.push(`[Video Frame Caption]: ${item.caption}`);
-                    });
-                } catch (e) { console.error('Video error'); }
-            
-            // FIXED: Added 'voice' to the included types list
-            } else if (['image', 'pdf', 'audio', 'voice'].includes(item.type)) {
-                try {
-                    const response = await axios.get(item.url, { responseType: 'arraybuffer' });
-                    processedContent.push({
-                        inlineData: { 
-                            data: Buffer.from(response.data).toString('base64'), 
-                            mimeType: item.mime 
-                        }
-                    });
-                    if (item.caption) textNotes.push(`[${item.type} caption]: ${item.caption}`);
-                } catch (e) { console.error('Download error'); }
-            
-            } else if (item.type === 'text') {
-                textNotes.push(item.text);
-            }
-        }
-    }
-
-    // --- LOGIC BRANCHING ---
-
-    // A. FOLLOW-UP (Reply)
-    if (previousContext) {
-        let prompt = "";
-        const instruction = previousContext.mode === 'secondary' 
-            ? SECONDARY_SYSTEM_INSTRUCTION 
-            : PRIMARY_SYSTEM_INSTRUCTION;
-
-        if (isQuestion(userQuery)) {
-            prompt = `User asks a QUESTION about the previous output.
-=== PREVIOUS OUTPUT ===
-${previousContext.responseText}
-=== NEW CONTEXT ===
-${textNotes.join('\n')}
-=== USER QUESTION ===
-${userQuery}
-Answer the question directly based on the context.`;
-        } else {
-            prompt = `User provides UPDATE/CORRECTION.
-=== PREVIOUS OUTPUT ===
-${previousContext.responseText}
-=== NEW INFO ===
-${userQuery}
-${textNotes.join('\n')}
-Generate UPDATED output.`;
-        }
-
-        const request = [prompt, ...processedContent];
-        const response = await generateGeminiResponse(request, instruction);
-        return { response, mode: previousContext.mode };
-    }
-
-    // B. NEW REQUEST - PRIMARY (Trigger: .)
-    if (mode === 'primary') {
-        const prompt = `Analyze these medical files.
-=== NOTES ===
-${textNotes.join('\n')}
-Generate the Clinical Profile.`;
-        
-        const request = [prompt, ...processedContent];
-        const response = await generateGeminiResponse(request, PRIMARY_SYSTEM_INSTRUCTION);
-        return { response, mode: 'primary' };
-    }
-
-    // C. NEW REQUEST - SECONDARY/CHAINED (Trigger: ..)
-    if (mode === 'secondary') {
-        // Step 1: Run Primary Logic (Internal)
-        const promptPrimary = `Analyze these medical files.
-=== NOTES ===
-${textNotes.join('\n')}
-Generate the Clinical Profile.`;
-        
-        const requestPrimary = [promptPrimary, ...processedContent];
-        const primaryResponse = await generateGeminiResponse(requestPrimary, PRIMARY_SYSTEM_INSTRUCTION);
-        
-        // Step 2: Feed Primary Result to Secondary Bot
-        const promptSecondary = `${SECONDARY_TRIGGER_PROMPT}
-
-=== CLINICAL PROFILE ===
-${primaryResponse}
-=== END PROFILE ===`;
-
-        const requestSecondary = [promptSecondary];
-        const secondaryResponse = await generateGeminiResponse(requestSecondary, SECONDARY_SYSTEM_INSTRUCTION);
-        
-        // Return BOTH responses
-        return { 
-            response: secondaryResponse, 
-            primaryResponse: primaryResponse, 
-            mode: 'secondary' 
-        };
-    }
-}
-
-function isQuestion(text) {
-    if (!text) return false;
-    const t = text.toLowerCase().trim();
-    return t.endsWith('?') || 
-           ['what', 'why', 'how', 'is', 'does', 'can', 'explain'].some(w => t.startsWith(w));
-}
-
-// --- TELEGRAM BOT LOGIC ---
-
+// ======================================================================
+// 📱 TELEGRAM BOT COMMANDS & HANDLERS
+// ======================================================================
 if (!CONFIG.TELEGRAM_TOKEN) {
-    console.error("❌ No TELEGRAM_BOT_TOKEN provided!");
-    process.exit(1);
+  console.error("❌ No TELEGRAM_BOT_TOKEN defined in environment!");
+  process.exit(1);
 }
 
 const bot = new Telegraf(CONFIG.TELEGRAM_TOKEN);
 
-bot.command('start', (ctx) => {
-    ctx.reply(`🏥 *Medical Bot Ready*
-    
-1️⃣ Send Files (Images, PDF, Video, Voice)
-2️⃣ Send command:
-   • *.*  (Standard Clinical Profile)
-   • *..* (Secondary Analysis Chain)
-   
-   (Add numbers 1 or 2 for video speed, e.g., .2 or ..2)
-   
-↩️ Reply to messages to continue context!`, { parse_mode: 'Markdown' });
+bot.command('start', async (ctx) => {
+  trackUser(ctx);
+  await ctx.reply(`🏥 *Medical Clinical Profile Bot Ready*
+
+*Supported Files:*
+📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Videos
+
+*Manual Processing Commands:*
+• *.* - Standard Clinical Profile (Smart 3 FPS)
+• *..* - Secondary Modality Chained Analysis (Profile + Advice)
+• *.1 / ..1* - Smart 1 FPS Extraction
+• *.2 / ..2* - Smart 2 FPS Extraction
+• *clear* - Clear buffered documents
+• *status* - View pending items in queue`, { parse_mode: 'Markdown' });
 });
 
-bot.command('clear', (ctx) => {
-    const items = clearBuffer(ctx.chat.id);
-    ctx.reply(`🗑️ Cleared ${items.length} items.`);
+bot.command('clear', async (ctx) => {
+  trackUser(ctx);
+  const chatId = ctx.chat.id;
+  const cleared = clearChatBuffer(chatId);
+  await ctx.reply(`🗑️ Cleared ${cleared.length} items from your buffer.`);
 });
 
-bot.on(message('text'), async (ctx) => {
-    const text = ctx.message.text.trim();
-    const chatId = ctx.chat.id;
+bot.command('status', async (ctx) => {
+  trackUser(ctx);
+  const chatId = ctx.chat.id;
+  const buffer = getChatBuffer(chatId);
+  const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
 
-    // 1. CHECK TRIGGERS
-    const isPrimary = /^(\.|(\.[1-3]))$/.test(text);
-    const isSecondary = /^(\.\.|(\.\.[1-3]))$/.test(text);
+  buffer.forEach(b => {
+    if (b.type === 'image') counts.images++;
+    else if (b.type === 'pdf') counts.pdfs++;
+    else if (b.type === 'audio' || b.type === 'voice') counts.audio++;
+    else if (b.type === 'video') counts.video++;
+    else if (b.type === 'text') counts.texts++;
+  });
 
-    if (isPrimary || isSecondary) {
-        const items = clearBuffer(chatId);
-        if (items.length === 0) return ctx.reply("⚠️ Buffer empty. Send files first.");
-
-        const lastChar = text.slice(-1);
-        let fps = isNaN(lastChar) ? 3 : parseInt(lastChar);
-        if (text === '.' || text === '..') fps = 3;
-
-        const mode = isSecondary ? 'secondary' : 'primary';
-        const label = isSecondary ? 'CHAINED Analysis' : 'Clinical Profile';
-
-        const loadingMsg = await ctx.reply(`⏳ Processing ${items.length} items (${label}, Smart ${fps} FPS)...`);
-        
-        try {
-            const result = await processRequest(chatId, items, mode, null, null, fps);
-            
-            // IF SECONDARY MODE: Send the Primary Response (Clinical Profile) First!
-            if (result.primaryResponse) {
-                await sendSafeMessage(ctx, result.primaryResponse, "📝 *Clinical Profile (Step 1):*\n\n");
-            }
-
-            // Send Final Response (Primary or Secondary)
-            const prefix = result.primaryResponse ? "🧠 *Secondary Analysis (Step 2):*\n\n" : "";
-            const lastMsg = await sendSafeMessage(ctx, result.response, prefix);
-
-            // Save Context
-            if (lastMsg) {
-                await ContextModel.create({
-                    chatId: String(chatId),
-                    messageId: String(lastMsg.message_id),
-                    originalMedia: items.map(i => ({ type: i.type, mime: i.mime })),
-                    responseText: result.response,
-                    mode: result.mode 
-                });
-            }
-            ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(()=>{});
-
-        } catch (e) {
-            ctx.reply(`❌ Error: ${e.message}`);
-        }
-        return;
-    }
-
-    // 2. CHECK REPLY
-    if (ctx.message.reply_to_message) {
-        const replyId = String(ctx.message.reply_to_message.message_id);
-        const context = await ContextModel.findOne({ chatId: String(chatId), messageId: replyId });
-
-        if (context) {
-            const loadingMsg = await ctx.reply(`🔄 Analyzing reply (${context.mode} context)...`);
-            try {
-                const result = await processRequest(
-                    chatId, [], context.mode, context, text
-                );
-                
-                const lastMsg = await sendSafeMessage(ctx, result.response);
-                
-                await ContextModel.create({
-                    chatId: String(chatId),
-                    messageId: String(lastMsg.message_id),
-                    originalMedia: context.originalMedia,
-                    responseText: result.response,
-                    mode: context.mode 
-                });
-                
-                ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(()=>{});
-
-            } catch (e) {
-                ctx.reply(`❌ Error: ${e.message}`);
-            }
-            return;
-        }
-    }
-
-    // 3. BUFFER TEXT
-    getBuffer(chatId).push({ type: 'text', text: text });
-    resetTimeout(chatId, ctx);
-    ctx.reply(`📝 Text note added.`);
+  const text = `📊 *Buffer Status:*
+📷 Images: ${counts.images}
+📄 PDFs: ${counts.pdfs}
+🎵 Audio/Voice: ${counts.audio}
+🎬 Videos: ${counts.video}
+📝 Text Notes: ${counts.texts}
+━━━━━━━━━━
+📦 Total buffered: ${buffer.length} / 20 items max`;
+  await ctx.reply(text, { parse_mode: 'Markdown' });
 });
 
-// MEDIA HANDLERS
-const handleMedia = async (ctx, type) => {
-    const chatId = ctx.chat.id;
-    let fileId, mime, caption;
+// View active unique users who interact with the bot
+bot.command('users', async (ctx) => {
+  trackUser(ctx);
+  const userId = String(ctx.from.id);
+  const adminId = CONFIG.ADMIN_ID;
 
-    if (type === 'photo') {
-        const photos = ctx.message.photo;
-        fileId = photos[photos.length - 1].file_id;
-        mime = 'image/jpeg';
-        caption = ctx.message.caption;
-    } else if (type === 'document') {
-        fileId = ctx.message.document.file_id;
-        mime = ctx.message.document.mime_type;
-        caption = ctx.message.caption;
-        if (!mime.includes('pdf')) return ctx.reply("⚠️ Only PDFs supported.");
-    } else if (type === 'video') {
-        fileId = ctx.message.video.file_id;
-        mime = ctx.message.video.mime_type;
-        caption = ctx.message.caption;
-    } else if (type === 'voice' || type === 'audio') {
-        const obj = ctx.message.voice || ctx.message.audio;
-        fileId = obj.file_id;
-        mime = obj.mime_type || 'audio/ogg';
-        caption = ctx.message.caption;
+  if (adminId && userId !== String(adminId)) {
+    return ctx.reply("⚠️ Access denied. You are not authorized to view bot statistics.");
+  }
+
+  if (registeredUsers.size === 0) {
+    return ctx.reply("👥 No active users recorded since the last boot.");
+  }
+
+  let userListText = `👥 *Unique Users since last startup (${registeredUsers.size}):*\n\n`;
+  registeredUsers.forEach((data, id) => {
+    userListText += `• *ID:* \`${id}\`\n  *Name:* ${data.name}\n  *Username:* ${data.username}\n  *Last Active:* ${data.lastSeen}\n\n`;
+  });
+
+  await sendSafeMessage(ctx, userListText);
+});
+
+// Media Queue Handlers
+const registerMediaItem = async (ctx, type, fileId, mimeType, captionText) => {
+  trackUser(ctx);
+  const chatId = ctx.chat.id;
+
+  try {
+    const loadingMsg = await ctx.reply(`📥 Downloading file to in-memory buffer...`);
+    const base64Data = await getTelegramFileAsBase64(ctx, fileId);
+    ctx.telegram.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+
+    const buffer = getChatBuffer(chatId);
+    if (buffer.length >= 20) {
+      await ctx.reply(`⚠️ Buffer is full. Clear using /clear or process using *.*`);
+      return;
     }
 
-    try {
-        const fileLink = await ctx.telegram.getFileLink(fileId);
-        getBuffer(chatId).push({
-            type: type === 'photo' ? 'image' : type,
-            // Capture 'voice' correctly in the buffer item type
-            type: type === 'photo' ? 'image' : type, 
-            url: fileLink.href,
-            mime: mime,
-            caption: caption || ''
-        });
-        resetTimeout(chatId, ctx);
-        ctx.reply(`📎 ${type.toUpperCase()} added.`);
-    } catch (e) {
-        ctx.reply("❌ Error getting file.");
-    }
+    buffer.push({
+      type: type,
+      data: base64Data,
+      mimeType: mimeType,
+      caption: captionText || ''
+    });
+
+    resetChatTimeout(chatId, ctx);
+    await ctx.reply(`📎 Added ${type.toUpperCase()} to queue. Queue count: *${buffer.length}*`, { parse_mode: 'Markdown' });
+
+  } catch (error) {
+    console.error('Buffer queue error:', error);
+    await ctx.reply(`❌ Failed to buffer file.`);
+  }
 };
 
-bot.on(message('photo'), ctx => handleMedia(ctx, 'photo'));
-bot.on(message('document'), ctx => handleMedia(ctx, 'document'));
-bot.on(message('video'), ctx => handleMedia(ctx, 'video'));
-bot.on(message('voice'), ctx => handleMedia(ctx, 'voice'));
-bot.on(message('audio'), ctx => handleMedia(ctx, 'audio'));
+bot.on(message('photo'), ctx => {
+  const photo = ctx.message.photo;
+  const fileId = photo[photo.length - 1].file_id;
+  registerMediaItem(ctx, 'image', fileId, 'image/jpeg', ctx.message.caption);
+});
 
-// STARTUP
-(async () => {
-    await connectMongoDB();
-    const app = express();
-    app.get('/', (req, res) => res.send('Telegram Medical Bot V3.2 Running'));
-    app.get('/health', (req, res) => res.json({status: 'ok'}));
-    app.listen(process.env.PORT || 3000);
+bot.on(message('document'), ctx => {
+  const doc = ctx.message.document;
+  if (!doc.mime_type || !doc.mime_type.includes('pdf')) {
+    return ctx.reply("⚠️ Only PDF documents are supported!");
+  }
+  registerMediaItem(ctx, 'pdf', doc.file_id, 'application/pdf', ctx.message.caption);
+});
 
-    bot.launch(() => console.log('🚀 Telegram Bot Started'));
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
-})();
+bot.on(message('video'), ctx => {
+  const vid = ctx.message.video;
+  registerMediaItem(ctx, 'video', vid.file_id, vid.mime_type || 'video/mp4', ctx.message.caption);
+});
+
+bot.on(message('voice'), ctx => {
+  const voice = ctx.message.voice;
+  registerMediaItem(ctx, 'voice', voice.file_id, voice.mime_type || 'audio/ogg', ctx.message.caption);
+});
+
+bot.on(message('audio'), ctx => {
+  const audio = ctx.message.audio;
+  registerMediaItem(ctx, 'audio', audio.file_id, audio.mime_type || 'audio/mpeg', ctx.message.caption);
+});
+
+// Text Note & Trigger Handlers
+bot.on(message('text'), async (ctx) => {
+  trackUser(ctx);
+  const text = ctx.message.text.trim();
+  const chatId = ctx.chat.id;
+
+  const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
+  const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
+
+  if (isPrimaryTrigger || isSecondaryTrigger) {
+    const mediaFiles = clearChatBuffer(chatId);
+    if (mediaFiles.length === 0) {
+      await ctx.reply("ℹ️ Buffer empty. Please upload some files or type some context first!");
+      return;
+    }
+
+    const lastChar = text.slice(-1);
+    let targetFps = 3;
+    if (!isNaN(parseInt(lastChar))) {
+      targetFps = parseInt(lastChar);
+    }
+
+    const mode = isSecondaryTrigger ? 'secondary' : 'primary';
+    const label = isSecondaryTrigger ? 'Chained Secondary Analysis' : 'Clinical Profile';
+
+    const statusMsg = await ctx.reply(`⏳ Running ${label} on ${mediaFiles.length} files (Smart ${targetFps} FPS)...`);
+
+    try {
+      await processMedia(ctx, chatId, mediaFiles, targetFps, isSecondaryTrigger);
+      ctx.telegram.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+    } catch (err) {
+      await ctx.reply(`❌ Processing Failed: ${err.message}`);
+    }
+    return;
+  }
+
+  // Handle clinical text input added to buffer
+  const buffer = getChatBuffer(chatId);
+  buffer.push({
+    type: 'text',
+    content: text
+  });
+  resetChatTimeout(chatId, ctx);
+  await ctx.reply(`📝 Text note added to buffer. Queue count: *${buffer.length}*`, { parse_mode: 'Markdown' });
+});
+
+// ======================================================================
+// 🌐 WEB SERVER & BOT INITIALIZATION
+// ======================================================================
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Telegram Medical Profile Bot Server Running Active'));
+app.get('/health', (req, res) => res.json({ status: 'healthy', database: 'none' }));
+app.listen(PORT, () => console.log(`🌐 Web server active on port ${PORT}`));
+
+bot.launch(() => console.log('🚀 Telegram Bot Engine Active (MongoDB and replies disabled)'));
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
